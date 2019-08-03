@@ -1,0 +1,5 @@
+#!/bin/bash
+
+trap "echo GOT_TRAP" SIGINT SIGTERM
+sleep 20
+echo "hello world"

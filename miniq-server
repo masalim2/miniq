@@ -1,0 +1,199 @@
+#!/usr/bin/env python
+from datetime import timedelta
+import asyncio
+import websockets
+from subprocess import STDOUT
+import os
+import json
+import sys
+
+DEFAULT_PORT=9876
+PORT = os.environ.get('MINIQ_PORT', DEFAULT_PORT)
+
+class JobQueue:
+    termination_grace_period = timedelta(seconds=10)
+
+    def __init__(self, max_queued, max_running):
+        self.max_queued = max_queued
+        self.run_sem = asyncio.BoundedSemaphore(max_running)
+        self.jobs = {}
+        self.processes = {}
+        self.queue = asyncio.Queue()
+        self.job_pk = 0
+
+    async def run(self):
+        """Start dequeuing & dispatching jobs"""
+        while True:
+                job = await self.queue.get()
+                asyncio.create_task(self._dispatch(job))
+
+    async def submit(self, script, nodes, time, cwd):
+        if nodes < 1 or time < 1:
+            raise ValueError("Invalid nodes or time")
+        if len(self.jobs) == self.max_queued:
+            raise ValueError(f"Max Queued Limit: {self.max_queued}")
+        job = await self._create_job(script, nodes, time, cwd)
+        return job
+
+    async def delete(self, id):
+        """
+        If job is running when deleted, have to dispatch a killer
+        """
+        job = self.jobs[id]
+        if job["state"] != "running":
+            job["state"] = "deleted"
+            del self.jobs[id]
+            print(f"[server] deleted job {id}")
+        else:
+            job["state"] = "killing"
+            asyncio.create_task(self._job_killer(job))
+        return job
+
+    async def status(self, id=None):
+        '''If id is None, return list of all job statuses'''
+        if id is None:
+            return list(self.jobs.values())
+        try:
+            stat = self.jobs[id]
+        except KeyError:
+            stat = None
+        return stat
+
+    @property
+    def _running_jobs(self):
+        return [j for j in self.jobs.values() if j['state']=='running']
+
+    @property
+    def _queued_jobs(self):
+        return [j for j in self.jobs.values() if j['state']=='queued']
+
+    async def _create_job(self, script, nodes, time, cwd):
+        """
+        Create a new job object & enqueue
+        """
+        self.job_pk += 1
+        job = {"job_id": self.job_pk, "script": script, "state": "queued", "nodes": nodes, "wall_time": time,
+               "runtime": None, "time_remaining": time, "cwd": cwd}
+        self.jobs[self.job_pk] = job
+        print(f"[server] created job {self.job_pk}")
+        await self.queue.put(job)
+        return job
+
+    async def _dispatch(self, job):
+        """
+        Start subprocess
+        Async-wait on subprocess shutdown, then cleanup
+        """
+        id = job['job_id']
+        script = job['script']
+        cwd = job['cwd']
+        env = os.environ.copy()
+        env["MINIQ_NODES"] = str(job["nodes"])
+        env["MINIQ_WALLTIME"] = str(job["wall_time"])
+
+        async with self.run_sem:
+            if id not in self.jobs:
+                print(f"[server] _dispatch for job {id} was deleted. skipping.")
+                return
+
+            job['state'] = 'running'
+            print(f"[server] Running Job {id}")
+
+            with open(os.path.join(cwd, f'{id}.out'), 'wb') as fp:
+                proc = await asyncio.create_subprocess_exec(
+                    script, cwd=cwd, stdout=fp, stderr=STDOUT,
+                    env=env
+                )
+                self.processes[id] = proc
+                await proc.wait()
+            del self.processes[id]
+            del self.jobs[id]
+
+    async def _job_killer(self, job):
+        """
+        Send SIGTERM, async-wait grace period, then SIGKILL
+        """
+        id = job["job_id"]
+        print(f"[server] starting cleanup of job {id}")
+        job["state"] = "killing"
+        self.processes[id].terminate()
+        await asyncio.sleep(self.termination_grace_period.total_seconds())
+        try:
+            self.processes[id].kill()
+        except KeyError:
+            pass
+        else:
+            print(f"[server] force-killed job {id}")
+
+    
+jobqueue = JobQueue(max_queued=10, max_running=3)
+
+async def send_error_response(websocket, msg):
+    resp = json.dumps({"error": msg, "status": "ERROR"})
+    await websocket.send(resp)
+
+def create_response(dat):
+    dat.update({"status": "OK"})
+    resp = json.dumps(dat)
+    return resp
+
+def get_view(request):
+    action = request["action"]
+    return getattr(sys.modules[__name__], f"view_{action}")
+
+async def view_submit(request):
+    script = request['script']
+    nodes = request['num_nodes']
+    minutes = request['minutes']
+    cwd = request['cwd']
+    job = await jobqueue.submit(script, nodes, minutes, cwd)
+    return create_response(job)
+
+async def view_delete(request):
+    id = request["id"]
+    job = await jobqueue.delete(id)
+    return create_response(job)
+
+async def view_status(request):
+    id = request.get("id", None)
+    stat = await jobqueue.status(id)
+    dat = {'job_state': stat}
+    return create_response(dat)
+
+async def server(websocket, path):
+    SUPPORTED_ACTIONS = [
+        fn.lstrip('view_')
+        for fn in dir(sys.modules[__name__])
+        if fn.startswith('view_')
+    ]
+    async for msg in websocket:
+        try:
+            request = json.loads(msg)
+        except:
+            await send_error_response(websocket, "bad JSON request")
+            continue
+
+        if 'action' not in request:
+            await send_error_response(websocket, "No action in request")
+            continue
+        elif request['action'] not in SUPPORTED_ACTIONS:
+            await send_error_response(websocket, f"Action {request['action']} is invalid")
+            continue
+        else:
+            view = get_view(request)
+
+        try:
+            response = await view(request)
+        except Exception as e:
+            msg = f'Exception in {view.__name__}\n{e}\n{e.__cause__}'
+            await send_error_response(websocket, msg)
+            continue
+        await websocket.send(response)
+
+async def main():
+    await websockets.serve(server,"0.0.0.0", PORT)
+    await asyncio.create_task(jobqueue.run())
+
+if __name__ == "__main__":
+    asyncio.get_event_loop().run_until_complete(main())
+    asyncio.get_event_loop().run_forever()
