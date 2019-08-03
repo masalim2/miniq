@@ -15,10 +15,10 @@ pipenv install -e .
 ```
 
 The following commands are added to your `PATH`:
-    1. miniq-server
-    2. qsub
-    3. qstat
-    4. qdel
+1. miniq-server
+2. qsub
+3. qstat
+4. qdel
 
 Start Server
 --------------
